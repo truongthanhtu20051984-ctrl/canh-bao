@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Cảnh báo khoảng cách và tốc độ</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<style>
+:root{--road:#15191d;--line:#f3f1e7;--amber:#ffb400;--red:#ff3b30;--ok:#2fd18b;--dim:#9aa3a8}
+*{box-sizing:border-box;margin:0}
+html,body{height:100%;background:var(--road);color:var(--line);font-family:system-ui,sans-serif;overflow:hidden}
+#stage{position:fixed;inset:0}
+video,#ov{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.hud{position:absolute;left:0;right:0;padding:calc(env(safe-area-inset-top,0px) + 10px) 14px 0;display:flex;justify-content:space-between;align-items:flex-start;pointer-events:none}
+.num{font-family:"Arial Narrow",Impact,sans-serif;font-weight:700;line-height:.9;text-shadow:0 2px 8px #000}
+#spd{font-size:96px}#spd small{font-size:24px;color:var(--dim);margin-left:4px}
+#lim{width:84px;height:84px;border-radius:50%;background:#fff;border:8px solid var(--red);color:#111;display:grid;place-items:center;font-size:38px}
+#lim.over{animation:p .6s infinite alternate}
+@keyframes p{to{background:#ffd0cc}}
+@media (prefers-reduced-motion:reduce){#lim.over{animation:none;background:#ffd0cc}}
+#gap{position:absolute;left:14px;bottom:calc(env(safe-area-inset-bottom,0px) + 14px);padding:10px 16px;border-radius:12px;background:#000a;border-left:8px solid var(--ok);min-width:150px}
+#gap .num{font-size:60px}#gap span{display:block;color:var(--dim);font-size:15px}
+#gap.warn{border-color:var(--amber)}#gap.danger{border-color:var(--red);background:#5a0b07cc}
+#map{position:absolute;right:12px;bottom:calc(env(safe-area-inset-bottom,0px) + 14px);width:42vw;max-width:260px;height:30vh;border-radius:12px;border:2px solid #000a;z-index:2}
+#bar{position:absolute;right:14px;top:calc(env(safe-area-inset-top,0px) + 104px);z-index:3;display:flex;gap:8px}
+button,select,input,label.btn{font:600 16px system-ui,sans-serif;color:var(--line);background:#000b;border:1px solid #fff4;border-radius:10px;padding:10px 14px}
+button:focus-visible,select:focus-visible,input:focus-visible{outline:3px solid var(--amber)}
+#start{position:absolute;inset:0;z-index:9;background:var(--road);display:grid;place-content:center;gap:16px;padding:24px;text-align:left;max-width:520px;margin:auto}
+#start h1{font:700 40px/1 "Arial Narrow",Impact,sans-serif}
+#start p{color:var(--dim);line-height:1.4}
+#go{background:var(--amber);color:#111;font-size:20px;padding:14px}
+#set{position:absolute;inset:auto 0 0 0;z-index:8;background:#101316f2;padding:16px 16px calc(env(safe-area-inset-bottom,0px) + 16px);display:none;gap:12px;flex-direction:column;max-height:75vh;overflow:auto}
+#set.open{display:flex}
+#set label{display:flex;flex-direction:column;gap:6px;color:var(--dim);font-size:15px}
+#msg{position:absolute;left:14px;right:14px;top:calc(env(safe-area-inset-top,0px) + 190px);z-index:3;color:var(--amber);font-size:16px;pointer-events:none;text-shadow:0 1px 4px #000}
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="v" playsinline muted></video>
+  <canvas id="ov"></canvas>
+  <div class="hud">
+    <div id="spd" class="num">0<small>km/h</small></div>
+    <div id="lim" class="num">--</div>
+  </div>
+  <div id="bar"><button id="gear" aria-label="Cài đặt">Cài đặt</button></div>
+  <div id="msg"></div>
+  <div id="gap"><div class="num" id="dist">--</div><span id="hw">Chưa thấy xe phía trước</span></div>
+  <div id="map"></div>
+</div>
+
+<div id="set">
+  <label>Camera
+    <select id="cam"></select>
+  </label>
+  <label>Góc nhìn ngang của camera: <b id="fovv">65</b>°
+    <input id="fov" type="range" min="45" max="120" value="65">
+  </label>
+  <p style="color:var(--dim);font-size:14px">Hiệu chỉnh: đặt một ô tô cách camera 10 m, chỉnh góc nhìn cho đến khi khoảng cách hiển thị gần 10 m.</p>
+  <label>Giới hạn tốc độ nhập tay (km/h), dùng khi bản đồ chưa có dữ liệu
+    <input id="manual" type="number" min="5" max="130" value="60">
+  </label>
+  <label>Nhập danh sách camera giám sát (CSV: vĩ độ,kinh độ,tên)
+    <input id="file" type="file" accept=".csv,.txt">
+  </label>
+  <button id="close">Đóng</button>
+</div>
+
+<div id="start">
+  <h1>Cảnh báo khoảng cách<br>và tốc độ</h1>
+  <p>Ứng dụng dùng camera, GPS và loa để cảnh báo khi bạn bám xe phía trước quá gần, chạy quá tốc độ hoặc sắp đến camera giám sát. Mọi xử lý nằm trên điện thoại, không ghi hình và không gửi hình ảnh đi đâu.</p>
+  <p>Gắn điện thoại cố định trước khi lái. Không thao tác khi xe đang chạy. Khoảng cách chỉ là ước lượng, không thay thế sự quan sát của bạn.</p>
+  <button id="go">Cho phép camera, vị trí và bắt đầu</button>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+const v=$('v'),ov=$('ov'),ctx=ov.getContext('2d');
+let model,stream,speed=0,limit=null,fov=65,distEma=null,cams=[],warned=new Set(),lastPos=null,lastFetch=null,marker,map,camLayer;
+const REAL={car:1.8,truck:2.5,bus:2.5,motorcycle:0.8};
+const NAMES={car:'Ô tô',truck:'Xe tải',bus:'Xe buýt',motorcycle:'Xe máy'};
+
+// ---- giọng nói ----
+const cool={};
+function say(text,key,ms){
+  const n=Date.now();
+  if(cool[key]&&n-cool[key]<ms)return;
+  cool[key]=n;
+  try{speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(text);u.lang='vi-VN';u.rate=1.05;speechSynthesis.speak(u);}catch(e){}
+}
+const note=t=>{$('msg').textContent=t||''};
+
+// ---- tiện ích ----
+function hav(a,b,c,d){const R=6371000,r=x=>x*Math.PI/180;const dl=r(c-a),dn=r(d-b);const h=Math.sin(dl/2)**2+Math.cos(r(a))*Math.cos(r(c))*Math.sin(dn/2)**2;return 2*R*Math.asin(Math.sqrt(h));}
+const lsGet=k=>{try{return localStorage.getItem(k)}catch(e){return null}};
+const lsSet=(k,x)=>{try{localStorage.setItem(k,x)}catch(e){}};
+
+// ---- camera ----
+async function openCam(id){
+  if(stream)stream.getTracks().forEach(t=>t.stop());
+  const video=id?{deviceId:{exact:id},width:{ideal:1280}}:{facingMode:'environment',width:{ideal:1280}};
+  stream=await navigator.mediaDevices.getUserMedia({video,audio:false});
+  v.srcObject=stream;await v.play();
+  ov.width=v.videoWidth;ov.height=v.videoHeight;
+}
+async function listCams(){
+  const d=(await navigator.mediaDevices.enumerateDevices()).filter(x=>x.kind==='videoinput');
+  const cur=stream&&stream.getVideoTracks()[0].getSettings().deviceId;
+  $('cam').innerHTML=d.map((x,i)=>`<option value="${x.deviceId}" ${x.deviceId===cur?'selected':''}>${x.label||'Camera '+(i+1)}</option>`).join('');
+}
+$('cam').onchange=e=>openCam(e.target.value).catch(er=>note('Không mở được camera này: '+er.message));
+
+// ---- nhận diện và khoảng cách ----
+function focalPx(){return (v.videoWidth/2)/Math.tan(fov*Math.PI/360)}
+async function loop(){
+  if(model&&v.readyState>=2){
+    const preds=await model.detect(v,6,0.5);
+    const W=v.videoWidth;ctx.clearRect(0,0,ov.width,ov.height);
+    let best=null;
+    for(const p of preds){
+      if(!REAL[p.class])continue;
+      const [x,y,w,h]=p.bbox,cx=x+w/2;
+      if(cx<W*.25||cx>W*.75)continue;
+      if(!best||w>best.bbox[2])best=p;
+    }
+    if(best){
+      const [x,y,w,h]=best.bbox;
+      const d=REAL[best.class]*focalPx()/w;
+      distEma=distEma==null?d:distEma*.7+d*.3;
+      const hw=speed>8?distEma/(speed/3.6):null;
+      const lvl=hw!=null&&hw<1?2:(hw!=null&&hw<2?1:0);
+      ctx.lineWidth=5;ctx.strokeStyle=['#2fd18b','#ffb400','#ff3b30'][lvl];ctx.strokeRect(x,y,w,h);
+      showGap(distEma,hw,lvl,NAMES[best.class]);
+      if(lvl==2)say('Nguy hiểm, giảm tốc độ','gap2',2500);
+      else if(lvl==1)say('Giữ khoảng cách','gap1',6000);
+    }else{distEma=null;showGap(null)}
+  }
+  setTimeout(()=>requestAnimationFrame(loop),120);
+}
+function showGap(d,hw,lvl,name){
+  const g=$('gap');g.className=lvl==2?'danger':lvl==1?'warn':'';
+  if(d==null){$('dist').textContent='--';$('hw').textContent='Chưa thấy xe phía trước';return}
+  $('dist').textContent='~'+Math.round(d)+' m';
+  $('hw').textContent=name+(hw!=null?' · cách '+hw.toFixed(1)+' giây':'');
+}
+
+// ---- GPS, tốc độ, giới hạn, camera giám sát ----
+function onPos(p){
+  const {latitude:la,longitude:lo,speed:s}=p.coords;
+  speed=s!=null&&s>0?s*3.6:0;
+  $('spd').firstChild.textContent=Math.round(speed);
+  if(map){const ll=[la,lo];marker.setLatLng(ll);map.setView(ll,16)}
+  if(!lastFetch||hav(la,lo,lastFetch[0],lastFetch[1])>60){lastFetch=[la,lo];fetchLimit(la,lo)}
+  const lim=limit||parseInt($('manual').value)||null;
+  $('lim').textContent=lim||'--';
+  const over=lim&&speed>lim+5;
+  $('lim').classList.toggle('over',!!over);
+  if(over)say('Bạn đang chạy quá tốc độ','over',15000);
+  cams.forEach((c,i)=>{
+    const d=hav(la,lo,c.la,c.lo);
+    if(d<400&&!warned.has(i)){warned.add(i);say('Phía trước có camera giám sát'+(c.name?', '+c.name:''),'cam'+i,1000)}
+    if(d>800)warned.delete(i);
+  });
+}
+async function fetchLimit(la,lo){
+  try{
+    const q=`[out:json][timeout:8];way(around:25,${la},${lo})["highway"]["maxspeed"];out tags 1;`;
+    const r=await fetch('https://overpass-api.de/api/interpreter?data='+encodeURIComponent(q));
+    const j=await r.json();
+    const m=j.elements[0]&&parseInt(j.elements[0].tags.maxspeed);
+    limit=m||null;
+  }catch(e){limit=null}
+}
+$('file').onchange=async e=>{
+  const t=await e.target.files[0].text();
+  cams=t.split(/\r?\n/).map(l=>l.split(',')).map(a=>({la:parseFloat(a[0]),lo:parseFloat(a[1]),name:(a[2]||'').trim()})).filter(c=>isFinite(c.la)&&isFinite(c.lo));
+  warned.clear();lsSet('cams',JSON.stringify(cams));drawCams();note('Đã nhập '+cams.length+' camera giám sát');
+};
+function drawCams(){if(!map)return;camLayer.clearLayers();cams.forEach(c=>L.circleMarker([c.la,c.lo],{radius:6,color:'#ff3b30'}).addTo(camLayer))}
+
+// ---- khởi động ----
+$('go').onclick=async()=>{
+  if(typeof cocoSsd==='undefined'||typeof L==='undefined'){note('Chưa tải được thư viện. Hãy kiểm tra kết nối mạng rồi tải lại trang.');return}
+  $('go').disabled=true;$('go').textContent='Đang tải…';
+  try{speechSynthesis.speak(new SpeechSynthesisUtterance(''))}catch(e){}
+  try{if('wakeLock' in navigator)await navigator.wakeLock.request('screen')}catch(e){}
+  try{await openCam();await listCams()}
+  catch(e){$('go').disabled=false;$('go').textContent='Thử lại';note('Chưa mở được camera. Hãy cho phép quyền camera trong cài đặt.');return}
+  $('start').style.display='none';
+  map=L.map('map',{zoomControl:false,attributionControl:false}).setView([16,106],5);
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19}).addTo(map);
+  marker=L.circleMarker([0,0],{radius:8,color:'#ffb400',fillOpacity:1}).addTo(map);
+  camLayer=L.layerGroup().addTo(map);
+  try{cams=JSON.parse(lsGet('cams')||'[]');drawCams()}catch(e){}
+  navigator.geolocation.watchPosition(onPos,er=>note('Không đọc được GPS: '+er.message),{enableHighAccuracy:true,maximumAge:1000});
+  note('Đang tải mô hình nhận diện xe…');
+  model=await cocoSsd.load({base:'lite_mobilenet_v2'});
+  note('');loop();
+};
+
+// ---- cài đặt ----
+$('gear').onclick=()=>$('set').classList.add('open');
+$('close').onclick=()=>$('set').classList.remove('open');
+$('fov').oninput=e=>{fov=+e.target.value;$('fovv').textContent=fov;lsSet('fov',fov)};
+const sf=lsGet('fov');if(sf){fov=+sf;$('fov').value=fov;$('fovv').textContent=fov}
+</script>
+</body>
+</html>
